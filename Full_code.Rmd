@@ -1,0 +1,960 @@
+---
+title: "Full code for network based data analysis project"
+author: "Stefano Cretti"
+output:
+  html_notebook:
+    code_folding: none
+    df_print: paged
+    theme: readable
+    toc: yes
+    toc_float: yes
+---
+
+# Preparatory steps
+
+## Loading packages
+Store package names in a vectors for ease of access and to load them easily 
+```{r, message=FALSE, warning=FALSE}
+PACKAGES <- c(
+  "caret",          # To create data partitions
+  "circlize",       # To create heatmap palette
+  "ComplexHeatmap", # To create better heatmaps
+  "dendextend",     # To plot dendrograms more clearly
+  "edgeR",          # To perform count normalization
+  "factoextra",     # To get better plots (ggplot wrapper)
+  "genefilter",     # To remove low count genes
+  "ggplot2",        # To plot and save images
+  "glmnet",         # To perform lasso-ridge
+  "glue",           # To use f strings 
+  "Gmisc",          # To join paths
+  "gprofiler2",     # To perform gene enrichment analysis
+  "igraph",         # To plot SCUDO results
+  "MASS",           # To use LDA function 
+  "pathfindR",      # To perform network based analysis 
+  "pROC",           # To plot ROC curves
+  "randomForest",   # To use random forest algorithm
+  "colorBlindness", # To create color blind friendly and aesthetic palette
+  "RColorBrewer",   # To define heatmap palette
+  "reshape2",       # To melt dataset for plotting
+  "recount3",       # To retrieve data from the database
+  "ROCR",           # To plot ROC curves 
+  "rScudo",         # To perform SCUDO classification
+  "tidyverse",      # To make data handling easier
+  "WilcoxCV"        # To perform feature selection
+)
+
+invisible(lapply(PACKAGES, library, character.only = TRUE))
+```
+
+Print current system info, R and packages versions (for reproducibility) 
+```{r}
+sessionInfo()
+```
+
+## Data retrieval
+Retrieve dataset from recount3; this object contains raw counts and metadata
+```{r, message=FALSE, warning=FALSE}
+recount_data <- recount3::create_rse_manual(
+    project = "SRP172499",
+    project_home = "data_sources/sra",
+    organism = "human",
+    annotation = "gencode_v26",
+    type = "gene"
+) 
+```
+
+Extract useful information from the recount3 object
+```{r}
+# r: genes, c: samples
+counts_raw   <- as.data.frame(assay(recount_data))      
+
+# r: genes, c: gene info
+info_genes   <- as.data.frame(rowData(recount_data)) %>%
+                dplyr::select(one_of(
+                  "info_genes", 
+                  "bp_length", 
+                  "gene_type", 
+                  "gene_name")
+                  )
+
+# r: samples c: metadata
+info_samples <- as.data.frame(colData(recount_data)) %>% 
+                dplyr::select(., sra.sample_attributes) %>%
+                separate(
+                  col=sra.sample_attributes, 
+                  into=c("ebv", "hist", "msi", "X", "subject_id", "tissue"),
+                  sep="\\|",
+                ) %>%
+                mutate_each(function(x) str_replace(x, ".*;;", "")) %>%
+                dplyr::select(-"X")
+```
+
+Define some values for convenience
+```{r}
+# r: samples, c: GC/HT
+INFO_TISSUE <- info_samples$tissue %>%
+               replace(., .=="gastric cancer", "GC") %>%
+               replace(., .=="normal stomach", "HT") %>%
+               as.factor() 
+
+# r: samples, c: bool
+IS_CANCER   <- INFO_TISSUE == "GC"    
+
+NUM_SAMPLES <- dim(info_samples)[1]
+```
+
+Remove recount3 object since not needed
+```{r}
+rm(recount_data)
+```
+
+## General defaults
+Seed to make every random step reproducible
+```{r}
+SEED <- 1234
+```
+
+Create color palette and tissue color index for plots
+```{r}
+PALETTE_DIFF <- colorBlindness::paletteMartin
+PALETTE_GRAD <- colorBlindness::Blue2DarkRed18Steps
+COL_GC <- PALETTE_GRAD[4]
+COL_HT <- PALETTE_GRAD[14]
+```
+
+Set output folders
+```{r}
+IMG_FOLDER <- "Images"
+dir.create(IMG_FOLDER)
+```
+
+
+# Preprocessing
+
+## Normalization
+Normalize counts using GeTMM (for both inter and intra sample variation). 
+```{r}
+# Convert raw counts to reads per kb of transcript (intra-sample variation)
+rpk_counts <- counts_raw*(10^3)/info_genes$bp_length  
+
+# Store rpk matrix into a DGEList object
+rpk_norm <- DGEList(
+  counts=rpk_counts, 
+  group=c(rep("Dummy_var", NUM_SAMPLES))
+  )
+
+# Compute and add the normalization factors (TMM default correction) to DGEList
+# (inter-sample variation)
+rpk_norm <- calcNormFactors(rpk_norm)
+
+# Rescale normalized counts in counts per million
+counts_GeTMM <- as.data.frame(cpm(rpk_norm))
+
+# Remove non-needed objects
+rm(rpk_counts, rpk_norm)
+```
+
+## Filtering
+Filtering parameters grouped for ease of access
+```{r}
+EXP_MIN <- 1       # Normalized reads to consider non-zero expression for...
+                   # ... a gene/feature in certain sample
+EXP_THRESH <- 0.2  # Max fraction of samples that can have minimal expression...
+                   # ... in order for the gene/feature to be kept
+```
+
+Remove features with very low expression in a certain amount of samples
+```{r}
+counts_clean <- filterfun(kOverA(                  # Create filter function
+                  EXP_THRESH * NUM_SAMPLES, 
+                  EXP_MIN
+                )) %>%
+                genefilter(counts_GeTMM, .) %>%    # Obtain indexer 
+                filter(counts_GeTMM, .)            # Filter dataset
+```
+
+Since there are many samples, to check the distribution we create a function to 
+plot the samples split into n groups and save them as jpgs
+```{r}
+segmented_hist <- function(data, rows){
+  
+  size = ceiling(dim(data)[1]/rows)
+  
+  for (seg in (1:rows)){
+
+    int_start = (1 + (seg-1)*size)
+    int_stop = seg*size
+  
+    tmp_df <- data[int_start:int_stop,]
+    tmp_df["Samples"] <- rownames(tmp_df)
+    tmp_df <- melt(tmp_df, id.vars="Samples", varnames=c("cpm"))
+    
+    print(ggplot(tmp_df, aes(x = Samples, y = log(value))) +
+      geom_boxplot() +
+      theme(axis.text.x = element_text(angle=-90))
+    )
+    
+    ggsave(
+      paste(glue("Normalized_counts_{seg}.jpg")),
+      path = IMG_FOLDER, 
+      device='jpg', 
+      dpi=700)
+  }
+}
+
+segmented_hist(as.data.frame(t(counts_clean)), 4)
+```
+
+Remove some non-needed objects
+```{r}
+rm(
+  counts_raw, 
+  counts_GeTMM, 
+  EXP_MIN, 
+  EXP_THRESH
+)
+```
+
+
+# Unsupervised methods (linear methods)
+
+## Principal component analysis 
+Transpose matrix and perform PCA
+```{r}
+res_pca <- prcomp(t(counts_clean))
+```
+
+Save table of dimension contribution
+```{r}
+eig_PCA <- get_eig(res_pca)
+```
+
+Display and save Scree plot 
+```{r}
+fviz_eig(res_pca)
+ggsave(
+  paste(glue("Scree_plot.jpg")),
+  path = IMG_FOLDER, 
+  device='jpg', 
+  dpi=700)
+```
+
+Save order of genes by model contribution 
+```{r}
+ord_pca <- facto_summarize(res_pca, "var") %>%
+           arrange(desc(contrib))
+```
+
+Plot PCA and save it 
+```{r}
+fviz_pca_ind(
+  res_pca,
+  geom = "point",
+  habillage = INFO_TISSUE,
+  legend.title = "Tissue",
+  mean.point = FALSE,
+  palette = c(COL_GC, COL_HT),
+  pointshape = 1,
+  pointsize = 2,
+  title = "PCA - Main directions",
+  ) +
+  theme_gray()
+
+ggsave(
+  paste(glue("PCA_plot.jpg")),
+  path = IMG_FOLDER, 
+  device='jpg', 
+  dpi=700)
+```
+
+The other features are too homogeneous and do not cluster at all
+(code removed to decrease clutter)
+
+
+# Unsupervised methods (machine learning methods)
+
+## K-means
+Compute k-means 
+```{r}
+set.seed(SEED)                                   # Set seed for reproducibility 
+NUM_K_KM <- 2                                    # Number of clusters
+res_kmeans <- kmeans(t(counts_clean), NUM_K_KM)  # Compute k-mean
+table(res_kmeans$cluster, INFO_TISSUE)           # Show group partition
+```
+
+Plot and save results 
+```{r}
+# Values to display in the legend
+SCALE_BREAKS <- c(
+  "Cluster 1 - Cancer",
+  "Cluster 1 - Normal",
+  "Cluster 2 - Cancer",
+  "Cluster 2 - Normal"
+  )
+
+COL_KMEANS <- c(
+  PALETTE_GRAD[1], 
+  PALETTE_GRAD[15],
+  PALETTE_GRAD[3],
+  PALETTE_GRAD[18],
+  "red",  # Cluster 1 throwaway 
+  "red"   # Cluster 2 throwaway
+)
+
+IS_CLUSTER_2 <- res_kmeans$cluster==2
+GROUPS <- rep("Cluster 1 - Cancer", NUM_SAMPLES) 
+GROUPS[!IS_CANCER] <- str_replace(GROUPS[!IS_CANCER], "Cancer", "Normal") 
+GROUPS[IS_CLUSTER_2] <- str_replace(GROUPS[IS_CLUSTER_2],"1","2")
+
+fviz_cluster(
+  res_kmeans, 
+  t(counts_clean),
+  axes = c(1, 2),
+  ellipse.alpha = 0.25,
+  geom = NULL,
+  main = "K-Means Results",
+  show.clust.cent = FALSE,
+  ) +
+  geom_point(
+    aes(colour = GROUPS), 
+    shape = IS_CLUSTER_2,
+  ) + 
+  scale_color_manual(
+    breaks=SCALE_BREAKS, 
+    values=COL_KMEANS,
+    name = "tissue"
+  )
+
+ggsave(
+  paste(glue("Kmeans_plot.jpg")),
+  path = IMG_FOLDER, 
+  device='jpg', 
+  dpi=700)
+```
+
+fviz_cluster applies a normalization to the PCA directions in order to have a 
+better visualization of the output
+
+Using log transform to reduce outlier influence 
+```{r}                                          
+res_kmeans_log <- kmeans(log(t(counts_clean)+1), NUM_K_KM)# Compute k-mean
+table(res_kmeans_log$cluster, INFO_TISSUE)                # Show group partition
+```
+
+Plot and save results of logarithmic model using first and second dimensions
+```{r}
+IS_CLUSTER_2 <- res_kmeans_log$cluster==2
+GROUPS <- rep("Cluster 1 - Cancer", NUM_SAMPLES) 
+GROUPS[!IS_CANCER] <- str_replace(GROUPS[!IS_CANCER], "Cancer", "Normal") 
+GROUPS[IS_CLUSTER_2] <- str_replace(GROUPS[IS_CLUSTER_2],"1","2")
+
+fviz_cluster(
+  res_kmeans_log, 
+  t(counts_clean),
+  axes = c(1, 2),
+  ellipse.alpha = 0.25,
+  geom = NULL,
+  main = "Log K-Means Results",
+  show.clust.cent = FALSE,
+  ) +
+  geom_point(
+    aes(colour = GROUPS), 
+    shape = IS_CLUSTER_2,
+  ) + 
+  scale_color_manual(
+    breaks=SCALE_BREAKS, 
+    values=COL_KMEANS,
+    name = "tissue"
+  )
+
+ggsave(
+  paste(glue("Kmeanslog_plot.jpg")),
+  path = IMG_FOLDER, 
+  device='jpg', 
+  dpi=700)
+```
+
+```{r}
+rm(
+  IS_CLUSTER_2, 
+  GROUPS, 
+  COL_KMEANS, 
+  NUM_K_KM, 
+  SCALE_BREAKS
+)
+```
+
+Remove for memory space 
+```{r}
+rm(
+  eig_PCA,
+  ord_pca,
+  res_kmeans,
+  res_kmeans_log,
+  res_pca
+)
+```
+
+
+## Hierarchical clustering
+Perform hierarchical clustering
+```{r}
+res_hier_tree <- dist(t(counts_clean)) %>%            # Compute distance matrix
+                 hclust(method="ave")                 # Create tree
+```
+
+```{r}
+NUM_K_HIER <- 16                                      # Number of clusters
+res_hier_clust <- cutree(res_hier_tree, k=NUM_K_HIER) # Cut tree in clusters
+table(res_hier_clust, INFO_TISSUE)                    # Print output
+```
+Number of K-iterations defined through manual testing 
+A lot of mono-sample branches, which are not ideal (difficult to classify).
+
+```{r}
+dend_hier <- as.dendrogram(res_hier_tree) %>%
+             set("branches_k_color", 
+                 value = rep(PALETTE_DIFF, 2)[1:NUM_K_HIER], 
+                 k = NUM_K_HIER
+                 ) %>%
+             set("labels", rep("", NUM_SAMPLES))
+
+jpeg(
+  glue(IMG_FOLDER, "/Hiertree_plot.jpg"), 
+  height = 12, width = 20, units='cm', res = 700
+  )
+
+plot(dend_hier, main = "Hierarchical clustering dendrogram") 
+color_bar <- ifelse(IS_CANCER, COL_GC, COL_HT)  
+colored_bars(colors = color_bar, dend = dend_hier, rowLabels = "Tissue" )
+dev.off()
+```
+
+```{r}
+rm(
+  NUM_K_HIER, 
+  res_hier_clust,
+  dend_hier,
+  color_bar
+)
+```
+For memory space
+```{r}
+rm(res_hier_tree)
+```
+
+# Feature selection
+Loose filtering using Wilcoxon test (since data is not normal distributed)
+
+Create two train-control splits (minimum needed for this function)
+```{r}
+set.seed(SEED)
+feat_sel_split <- generate.split(
+  2,                            # The function requires at least 2 iterations
+  length(counts_clean),         # Total sample number
+  length(counts_clean)*0.2      # Samples used for testing
+  )
+```
+
+Perform Wilcoxon rank sum test (same as Mann-Whitney)
+```{r}
+res_wilcoxon <- wilcox.selection.split(
+  t(counts_clean),     # Data matrix
+  IS_CANCER,           # Vector of bools (T=cancer)
+  feat_sel_split,      # Partitions for Monte Carlo 
+  algo="new",          # Algorithm used, see doi:10.1093/bioinformatics/btm162
+  pvalue=TRUE          # Return matrix of pvalues (rows = iter, col = gene)
+  )
+```
+
+Genes sorted by adjusted p value ("holm" correction) for Wilcoxon test
+```{r}
+ord_wilcoxon <- res_wilcoxon$pvalue.split %>%
+                apply(1, p.adjust) %>%
+                apply(1, max) %>% 
+                as.data.frame() 
+
+colnames(ord_wilcoxon) <- c("adj_p_vals")
+ord_wilcoxon <- arrange(ord_wilcoxon, adj_p_vals)
+```
+
+Define a threshold for the adjusted p value
+```{r}
+THRESH_WILC <- 0.001  # Arbitrary, just to get about top 3000 genes 
+```
+
+Retrieve counts for top genes
+```{r}
+counts_filt <- ord_wilcoxon %>%
+               filter(adj_p_vals < THRESH_WILC) %>%
+               row.names() %>%
+               counts_clean[.,]
+```
+
+```{r}
+rm(
+  THRESH_WILC, 
+  feat_sel_split,
+  res_wilcoxon
+)
+```
+
+
+# Supervised methods (machine learning methods)
+
+Set some parameters for both filtered and unfiltered approach
+```{r}
+NUM_TREES <- 1000  # Number of iteration for random forest
+NUM_HEAT  <- 25    # Number of top genes to plot in the heatmap
+HEAT_TOPBAR <- c(
+  rep(COL_HT, sum(info_samples$tissue == "normal stomach")), 
+  rep(COL_GC, sum(info_samples$tissue == "gastric cancer"))
+  )
+
+info_genes <- info_genes %>% rownames_to_column("ens_id")
+
+sample_order <- arrange(info_samples, desc(tissue)) %>%
+                rownames()
+```
+
+
+## Random forest
+
+```{r}
+set.seed(SEED)
+res_rf_filt <- randomForest(
+  x=t(counts_filt), 
+  y=as.factor(IS_CANCER), 
+  ntree=NUM_TREES
+  )
+```
+
+Check that the model stabilizes
+```{r}
+plot(res_rf_filt)
+```
+
+```{r}
+ord_rf_filt <- importance(res_rf_filt) %>% 
+               as.data.frame() %>%
+               arrange(desc(MeanDecreaseGini))
+```
+
+Plot contributions and save the image
+```{r}
+ggplot(
+  ord_rf_filt, 
+  aes(x = seq(1:dim(ord_rf_filt)[1]), y = MeanDecreaseGini)
+  ) +
+  geom_line() + 
+  xlim(1, 2000) + 
+  coord_trans(x = "log10") + 
+  ylab("Gene importance (Mean Decrease Gini)") + 
+  xlab("n-th gene by Mean Decrease Gini") +
+  scale_x_continuous(breaks = c(1, 10, 50, 100, 200, 500, 1000, 2000)) + 
+  geom_vline(
+    xintercept = 50, 
+    linetype="dashed", 
+    color = PALETTE_DIFF[6], 
+    size=1.25
+  ) + 
+  geom_vline(
+    xintercept = 200, 
+    linetype="dashed", 
+    color = PALETTE_DIFF[13], 
+    size=1.2
+  ) + 
+  geom_vline(
+    xintercept = 500, 
+    linetype="dashed", 
+    color = PALETTE_DIFF[14], 
+    size=1.25
+  )
+
+ggsave(
+  paste(glue("Filt_gini.jpg")),
+  path = IMG_FOLDER, 
+  device='jpg', 
+  dpi=700)
+```
+
+Subset and reshape data to use in the heatmap
+```{r}
+top_heat_filt <- top_n(ord_rf_filt, NUM_HEAT, MeanDecreaseGini) %>%
+                 row.names() %>%
+                 counts_clean[.,] %>%
+                 rownames_to_column("ens_id") %>%
+                 inner_join(., info_genes, by="ens_id") %>%
+                 column_to_rownames("gene_name") %>%
+                 select(-c("ens_id", "bp_length", "gene_type")) %>%
+                 .[,sample_order] %>%
+                 arrange(-row_number())
+```
+
+Other preparatory steps for the heatmap
+```{r}
+gene_functions <- rownames_to_column(top_heat_filt, "gene_name") %>% 
+                  left_join(info_genes, by="gene_name") %>%
+                  select(gene_type)
+naming_vector <- ifelse(
+  gene_functions == "protein_coding", 
+  "protein coding",
+  "lncRNA"
+  )
+```
+
+Create heatmap
+```{r}
+
+ht <-Heatmap(
+  as.matrix(top_heat_filt),
+  name = "cpm",
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_order =  seq(1, 25, 1),
+  column_order = seq(1, 159, 1),
+  row_names_gp = gpar(fontsize = 12),
+  column_names_gp = gpar(fontsize = 6),
+  column_split = factor(c(rep("Healthy", 79), rep("Cancer", 80))),
+  column_title = "%s",
+  row_split = naming_vector,
+  row_title = "%s",
+  col = colorRamp2(c(0, 100, 200), c("blue", "white", "red")),
+  show_column_names = FALSE
+  )
+
+```
+
+Save heatmap
+```{r}
+jpeg(
+  glue(IMG_FOLDER, "/heatmap.jpg"), 
+  height = 12, width = 16, units='cm', res = 700
+  )
+draw(ht)
+dev.off()
+```
+
+```{r}
+rm(
+  HEAT_TOPBAR,
+  NUM_TREES,
+  NUM_HEAT,
+  res_rf_filt,
+  sample_order,
+  top_heat_filt
+)
+```
+
+
+# Supervised methods (linear methods)
+
+## Linear discriminant analysis
+
+Create copy of filtered data with sample tissue information associated
+```{r}
+counts_filt_tissue <- cbind(
+  as.data.frame(t(counts_filt)), 
+  as.factor(INFO_TISSUE)
+  )
+colnames(counts_filt_tissue)[ncol(counts_filt_tissue)] <- "Tissue"
+```
+
+Perform LDA, plot it and save it
+```{r}
+set.seed(SEED)
+train_lda <- createDataPartition(IS_CANCER, p = 0.75, list = FALSE)
+
+single_lda <- lda(
+  Tissue ~ ., 
+  data = counts_filt_tissue, 
+  prior = c(0.5,0.5),
+  subset = train_lda)
+
+jpeg(
+  glue(IMG_FOLDER, "/separation_LDA.jpg"), 
+  height = 15, width = 20, units='cm', res = 700
+  )
+
+plot(single_lda)
+
+dev.off()
+```
+
+Check confusion matrices 
+Confusion matrix on training data
+```{r}
+conf_train_lda <- predict(single_lda, counts_filt_tissue[train_lda,])
+table(conf_train_lda$class, counts_filt_tissue$Tissue[train_lda])
+```
+Confusion matrix on test data
+```{r}
+conf_test_lda <- predict(single_lda, counts_filt_tissue[-train_lda,])
+table(conf_test_lda$class, counts_filt_tissue$Tissue[-train_lda])
+```
+Model performs pretty well in both cases
+
+```{r}
+rm(
+  train_lda,
+  single_lda,
+  conf_train_lda,
+  conf_test_lda
+)
+```
+
+## Lasso
+Regression model to perform classification
+Lambda is a tuning parameter for the shrinkage (0 -> none, 1 -> max)
+
+Try splitting into train and test sets
+```{r}
+set.seed(SEED)
+train_lasso <- createDataPartition(IS_CANCER, p = 0.75, list = FALSE)
+
+single_lasso_tt <- glmnet(
+  as.data.frame(t(counts_filt))[train_lasso,],
+  IS_CANCER[train_lasso],
+  standardize = FALSE, 
+  family = "binomial",
+)
+
+plot(single_lasso_tt, xvar="lambda", label = TRUE)
+
+single_lasso_tt_cv <- cv.glmnet(
+  t(counts_filt)[train_lasso,],
+  IS_CANCER[train_lasso],
+  standardize = FALSE, 
+  family = "binomial",
+) 
+
+plot(single_lasso_tt_cv)
+```
+Results inconsistent (olfattory sensor genes, others), but still 3/4 at a time
+The optimal number of genes seems 3-4, but no clear minimum is reached
+
+Plot confusion matrix of train data
+```{r}
+conf_lasso_train <- predict(
+  single_lasso_tt, 
+  t(counts_filt)[train_lasso,],
+  type="class",
+  s=single_lasso_tt_cv$lambda.min)
+
+table(conf_lasso_train, IS_CANCER[train_lasso])
+```
+
+Plot confusion matrix of test data
+```{r}
+conf_lasso_resp <- predict(
+  single_lasso_tt, 
+  t(counts_filt)[-train_lasso,],
+  type="class",
+  s=single_lasso_tt_cv$lambda.min)
+
+table(conf_lasso_resp, IS_CANCER[-train_lasso])
+```
+
+Plot ROC of test data
+```{r}
+conf_lasso_roc <- predict(
+  single_lasso_tt, 
+  t(counts_filt)[-train_lasso,],
+  type="response",
+  s=single_lasso_tt_cv$lambda.min)
+
+plot(performance(
+  prediction(conf_lasso_roc, IS_CANCER[-train_lasso]),
+  'tpr',
+  'fpr'))
+```
+
+Compute AUC
+```{r}
+performance(
+  prediction(
+    conf_lasso_roc, 
+    IS_CANCER[-train_lasso]),
+  'auc') %>% 
+  .@y.values %>%
+  as.numeric()
+```
+Not as good as other methods but still very good
+
+```{r}
+rm(
+  conf_lasso_train,
+  conf_lasso_resp,
+  conf_lasso_roc,
+  train_lasso,
+  single_lasso_tt,
+  single_lasso_tt_cv
+)
+```
+
+
+## SCUDO 
+
+Create data partition
+```{r}
+set.seed(2345)  # Different seed because other partitions do not generate plots
+part_scudo  <- createDataPartition(IS_CANCER, list=FALSE)
+train_scudo <- counts_filt[, part_scudo]
+test_scudo  <- counts_filt[, -part_scudo]
+```
+
+Fit SCUDO model using train data (using arbitrary number of top and bottom)
+```{r}
+set.seed(SEED)
+res_scudo <- scudoTrain(
+  train_scudo, 
+  groups=as.factor(IS_CANCER[part_scudo]),
+  nTop=200,
+  nBottom=200, 
+  alpha=0.05)
+```
+
+Create a network and plot it
+```{r}
+set.seed(SEED)
+scudo_net <- scudoNetwork(res_scudo, N = 0.4)
+scudoPlot(scudo_net, vertex.label=NA)
+```
+
+Perform validation using test data
+```{r}
+set.seed(SEED)
+valid_scudo <- scudoTest(
+  res_scudo, 
+  test_scudo, 
+  as.factor(IS_CANCER[-part_scudo]),
+  nTop=150,
+  nBottom=150)
+```
+
+Then plot the result
+```{r}
+set.seed(SEED)
+valid_scudo_net <- scudoNetwork(valid_scudo, N=0.3)
+scudoPlot(valid_scudo_net, vertex.label = NA)
+```
+Seems to perform well
+
+Evaluate model performance
+```{r}
+perf_scudo <- scudoClassify(
+  train_scudo, 
+  test_scudo, 
+  N=0.3,
+  nTop=200,
+  nBottom=200,
+  trainGroups=as.factor(IS_CANCER[part_scudo]),
+  alpha=0.05)
+confusionMatrix(perf_scudo$predicted, as.factor(IS_CANCER[-part_scudo]))
+```
+Probably second best after random forest
+
+```{r}
+rm(
+  part_scudo, 
+  perf_scudo,
+  scudo_net,
+  test_scudo,
+  train_scudo,
+  valid_scudo, 
+  valid_scudo_net,
+  res_scudo
+)
+```
+
+# Gene set analysis 
+Since the best classifier was the random forest one, for these analyses we will 
+be using the genes in order of relevance for the model. 
+
+## Associate gene names
+The genes right now are identified by their ensembl identifier with the isoform.
+Moreover these identifiers are used as rownames, and some of the following 
+functions require them in a column. Finally some functions (namely pathfindr) 
+does not recognize ensembl ids but only gene symbols. Performing the due changes
+
+```{r}
+gene_rf <- rownames(ord_rf_filt) %>%
+           data.frame(ens_id = .) %>%
+           inner_join(., info_genes, by="ens_id") %>%
+           separate(
+             col= ens_id,
+             into=c("ens_id", "isoform"),
+             sep="[.]",
+           ) %>%
+           dplyr::select(-c("isoform", "bp_length", "gene_type"))
+
+gene_rf$gini <- ord_rf_filt$MeanDecreaseGini
+
+gene_pval <- rownames(ord_wilcoxon) %>%
+             data.frame(ens_id = .) %>%
+             inner_join(., info_genes, by="ens_id") %>%
+             separate(
+               col= ens_id,
+               into=c("ens_id", "isoform"),
+               sep="[.]",
+             ) %>%
+             dplyr::select(-c("isoform", "bp_length", "gene_type"))
+gene_pval$pval <- ord_wilcoxon$adj_p_vals
+
+```
+
+
+## G profiler
+Ensembl ids work better with g profiler 
+
+```{r}
+res_gost <- gost(
+  query = gene_rf$ens_id[1:200],
+  organism = "hsapiens",
+  ordered_query = TRUE,
+  multi_query = FALSE,
+  significant = TRUE,
+  exclude_iea = FALSE,
+  measure_underrepresentation = FALSE, 
+  evcodes = FALSE,
+  user_threshold = 0.05,
+  custom_bg = NULL,
+  numeric_ns = "",
+  sources = ,
+  as_short_link = FALSE
+)
+```
+
+To save plot
+```{r eval=FALSE}
+plot_gost <- gostplot(res_gost , capped = TRUE , interactive = FALSE)
+publish_gostplot(
+  plot_gost, 
+  highlight_terms = plot_gost$data$term_id[plot_gost$data$p_value < 10e-12] ,
+  width = NA,
+  height = 10 , 
+  filename = "gplot.png")
+```
+
+## Pathfindr
+```{r}
+gene_rf_pvals <- select(gene_pval, -gene_name) %>% 
+                 left_join(gene_rf, ., by="ens_id")
+```
+
+```{r}
+res_path <- run_pathfindR(
+  gene_rf_pvals[1:200, c("gene_name", "pval")],
+  iterations = 10,
+  visualize_enriched_terms = FALSE
+)
+```
+Save plot by hand as "pathfindr.png"
+
+```{r}
+rm(
+  res_gost,
+  res_path
+)
+```
+
