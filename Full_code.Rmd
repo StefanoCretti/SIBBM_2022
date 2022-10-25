@@ -66,12 +66,11 @@ recount_data <- recount3::create_rse_manual(
 Extract useful information from the recount3 object
 ```{r}
 # r: genes, c: samples
-counts_raw   <- as.data.frame(assay(recount_data))      
+counts_raw   <- compute_read_counts(recount_data)
 
 # r: genes, c: gene info
 info_genes   <- as.data.frame(rowData(recount_data)) %>%
                 dplyr::select(one_of(
-                  "info_genes", 
                   "bp_length", 
                   "gene_type", 
                   "gene_name")
@@ -587,22 +586,24 @@ top_heat_filt <- top_n(ord_rf_filt, NUM_HEAT, MeanDecreaseGini) %>%
                  inner_join(., info_genes, by="ens_id") %>%
                  column_to_rownames("gene_name") %>%
                  select(-c("ens_id", "bp_length", "gene_type")) %>%
-                 .[,sample_order] %>%
-                 arrange(-row_number())
+                 .[,sample_order]
 ```
 
 Other preparatory steps for the heatmap
 ```{r}
-gene_functions <- rownames_to_column(top_heat_filt, "gene_name") %>% 
-                  left_join(info_genes, by="gene_name") %>%
+gene_functions <- top_n(ord_rf_filt, NUM_HEAT, MeanDecreaseGini) %>%
+                  row.names() %>%
+                  counts_clean[.,] %>%
+                  rownames_to_column("ens_id") %>%
+                  inner_join(., info_genes, by="ens_id") %>%
                   select(gene_type)
+  
 naming_vector <- ifelse(
   gene_functions == "protein_coding", 
   "protein coding",
   "lncRNA"
   )
 ```
-
 Create heatmap
 ```{r}
 
@@ -611,13 +612,13 @@ ht <-Heatmap(
   name = "cpm",
   cluster_rows = FALSE,
   cluster_columns = FALSE,
-  row_order =  seq(1, 25, 1),
-  column_order = seq(1, 159, 1),
+  row_order = seq(1, NUM_HEAT, 1),
+  column_order = seq(1, NUM_SAMPLES, 1),
   row_names_gp = gpar(fontsize = 12),
   column_names_gp = gpar(fontsize = 6),
   column_split = factor(c(rep("Healthy", 79), rep("Cancer", 80))),
   column_title = "%s",
-  row_split = naming_vector,
+  row_split = factor(naming_vector),
   row_title = "%s",
   col = colorRamp2(c(0, 100, 200), c("blue", "white", "red")),
   show_column_names = FALSE
@@ -628,8 +629,8 @@ ht <-Heatmap(
 Save heatmap
 ```{r}
 jpeg(
-  glue(IMG_FOLDER, "/heatmap.jpg"), 
-  height = 12, width = 16, units='cm', res = 700
+  glue(IMG_FOLDER, "/heatmap_25.jpg"), 
+  height = 16, width = 16, units='cm', res = 700
   )
 draw(ht)
 dev.off()
@@ -930,7 +931,7 @@ To save plot
 plot_gost <- gostplot(res_gost , capped = TRUE , interactive = FALSE)
 publish_gostplot(
   plot_gost, 
-  highlight_terms = plot_gost$data$term_id[plot_gost$data$p_value < 10e-12] ,
+  highlight_terms = plot_gost$data$term_id[plot_gost$data$p_value < 10e-10] ,
   width = NA,
   height = 10 , 
   filename = "gplot.png")
